@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+from PySide6.QtCore import QCoreApplication, QResource
+from PySide6.QtWidgets import QApplication
+
+from AppKit import (
+    NSApplication,
+    NSEventMaskLeftMouseUp,
+    NSEventMaskRightMouseUp,
+    NSEventModifierFlagControl,
+    NSEventTypeRightMouseUp,
+    NSObject,
+    NSStatusBar,
+    NSVariableStatusItemLength,
+    NSImage,
+    NSImageLeft,
+    NSMenu,
+    NSMenuItem,
+)
+from Foundation import NSData
+
+from app.config.cfg import cfg
+from app.format import toReadableSize
+
+
+class MenuTarget(NSObject):
+    owner = None
+
+    def menuNeedsUpdate_(self, menu):
+        if self.owner is not None:
+            self.owner._refreshMenuItems()
+
+    def menuDidClose_(self, menu):
+        self.owner._statusItem.setMenu_(None)
+
+    def onClicked_(self, sender):
+        event = NSApplication.sharedApplication().currentEvent()
+        if event.type() == NSEventTypeRightMouseUp or event.modifierFlags() & NSEventModifierFlagControl:
+            self.owner._statusItem.setMenu_(self.owner._menu)
+            self.owner._button.performClick_(None)
+        else:
+            self.owner._show()
+
+    def showDashboard_(self, sender):
+        self.owner._show().showTasks()
+
+    def newTask_(self, sender):
+        self.owner._show().addUrls([])
+
+    def startAll_(self, sender):
+        self.owner._taskService.startAll()
+
+    def pauseAll_(self, sender):
+        self.owner._taskService.pauseAll()
+
+    def openSettings_(self, sender):
+        self.owner._show().showSettings()
+
+    def quitApp_(self, sender):
+        QApplication.instance().quit()
+
+
+class MacStatusItem:
+    ICON_SIZE = 16
+
+    def __init__(self, taskService, show):
+        self._taskService = taskService
+        self._show = show
+        self._statusItem = NSStatusBar.systemStatusBar().statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        self._button = self._statusItem.button()
+        self._button.setImage_(self._buildMenuBarIcon())
+        self._button.setImagePosition_(NSImageLeft)
+
+        self._target = MenuTarget.alloc().init()
+        self._target.owner = self
+
+        self._menu = self._buildMenu()
+        self._startAllItem = self._menu.itemAtIndex_(2)
+        self._pauseAllItem = self._menu.itemAtIndex_(3)
+
+        self._button.setTarget_(self._target)
+        self._button.setAction_("onClicked:")
+        self._button.sendActionOn_(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)
+
+        cfg.shouldShowMenuBarSpeed.valueChanged.connect(self._onShowSpeedChanged)
+
+    def show(self) -> None:
+        self._statusItem.setVisible_(True)
+
+    def setSpeed(self, bytesPerSecond: int) -> None:
+        if cfg.shouldShowMenuBarSpeed.value and bytesPerSecond > 0:
+            self._button.setTitle_(f" {toReadableSize(bytesPerSecond)}/s")
+        else:
+            self._button.setTitle_("")
+
+    def _buildMenu(self) -> NSMenu:
+        menu = NSMenu.alloc().init()
+        menu.setAutoenablesItems_(False)
+        menu.setDelegate_(self._target)
+        for entry in (
+            (QCoreApplication.translate("SystemTrayIcon", "仪表盘"), "showDashboard:", "", "gauge.open.with.lines.needle.33percent"),
+            (QCoreApplication.translate("SystemTrayIcon", "新建任务"), "newTask:", "", "plus"),
+            (QCoreApplication.translate("SystemTrayIcon", "全部开始"), "startAll:", "", "play.fill"),
+            (QCoreApplication.translate("SystemTrayIcon", "全部暂停"), "pauseAll:", "", "pause.fill"),
+            (QCoreApplication.translate("SystemTrayIcon", "设置"), "openSettings:", "", "gearshape"),
+            None,
+            (QCoreApplication.translate("SystemTrayIcon", "退出程序"), "quitApp:", "q", "power"),
+        ):
+            if entry is None:
+                menu.addItem_(NSMenuItem.separatorItem())
+                continue
+            title, selector, key, symbol = entry
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, selector, key)
+            item.setTarget_(self._target)
+            image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, None)
+            if image:
+                item.setImage_(image)
+            menu.addItem_(item)
+        return menu
+
+    def _refreshMenuItems(self) -> None:
+        from app.models.task import TaskStatus
+
+        tasks = self._taskService.tasks
+        self._startAllItem.setEnabled_(
+            any(t.status in {TaskStatus.PAUSED, TaskStatus.FAILED, TaskStatus.WAITING} for t in tasks)
+        )
+        self._pauseAllItem.setEnabled_(
+            any(t.status == TaskStatus.RUNNING for t in tasks)
+        )
+
+    def _buildMenuBarIcon(self) -> NSImage:
+        raw = QResource(":/image/logo_menubar_template.png").data()
+        image = NSImage.alloc().initWithData_(NSData.dataWithBytes_length_(raw, len(raw)))
+        size = image.size()
+        image.setSize_((self.ICON_SIZE * size.width / size.height, self.ICON_SIZE))
+        image.setTemplate_(True)
+        return image
+
+    def _onShowSpeedChanged(self, enabled: bool) -> None:
+        if not enabled:
+            self._button.setTitle_("")

@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+from app.config.paths import EXECUTABLE_PATH
+
+
+def setRunAtLogin(enabled: bool) -> None:
+    if sys.platform == "win32":
+        _setWindows(enabled)
+    elif sys.platform == "darwin":
+        _setMacOS(enabled)
+    elif sys.platform == "linux":
+        _setLinux(enabled)
+
+
+def _setWindows(enabled: bool) -> None:
+    import winreg
+
+    key = winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        0, winreg.KEY_WRITE,
+    )
+    if enabled:
+        winreg.SetValueEx(key, "GhostDownloader", 0, winreg.REG_SZ, f'"{EXECUTABLE_PATH}" --silence')
+    else:
+        try:
+            winreg.DeleteValue(key, "GhostDownloader")
+        except FileNotFoundError:
+            pass
+    winreg.CloseKey(key)
+
+
+def _setMacOS(enabled: bool) -> None:
+    from pwd import getpwuid
+    from app.config.constants import DESKTOP_ID
+    plistPath = Path(f"/Users/{getpwuid(os.getuid()).pw_name}/Library/LaunchAgents/{DESKTOP_ID}.plist")
+
+    if enabled:
+        plistPath.parent.mkdir(parents=True, exist_ok=True)
+        plistPath.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n<dict>\n'
+            f'<key>Label</key>\n<string>{DESKTOP_ID}</string>\n'
+            '<key>ProgramArguments</key>\n<array>\n'
+            f'<string>{EXECUTABLE_PATH}</string>\n<string>--silence</string>\n'
+            '</array>\n<key>RunAtLoad</key>\n<true/>\n'
+            '</dict>\n</plist>\n',
+            encoding="utf-8",
+        )
+    else:
+        plistPath.unlink(missing_ok=True)
+
+
+def _setLinux(enabled: bool) -> None:
+    from app.config.constants import DESKTOP_ID
+
+    configHome = Path(v) if (v := os.environ.get("XDG_CONFIG_HOME", "")).startswith("/") else Path.home() / ".config"
+    autoStartDir = configHome / "autostart"
+    desktopFile = autoStartDir / f"{DESKTOP_ID}.desktop"
+
+    if enabled:
+        autoStartDir.mkdir(parents=True, exist_ok=True)
+        desktopFile.write_text(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=Ghost Downloader\n"
+            "Comment=The only downloader you need\n"
+            f'Exec="{EXECUTABLE_PATH}" --silence\n'
+            "Icon=ghost-downloader\n"
+            "StartupNotify=false\n"
+            "Terminal=false\n",
+            encoding="utf-8",
+        )
+    else:
+        desktopFile.unlink(missing_ok=True)

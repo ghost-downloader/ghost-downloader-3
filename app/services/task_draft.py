@@ -1,0 +1,270 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from collections.abc import Callable
+from typing import Any, TYPE_CHECKING
+
+from app.signal import Signal
+from loguru import logger
+
+from app.config.cfg import saveLastOutputFolder
+from app.models.task import TaskError, TaskOptions, toTaskError
+
+if TYPE_CHECKING:
+    from app.models.task import Task
+
+
+@dataclass
+class DraftItem:
+    url: str
+    parseId: str = ""
+    task: Task | None = None
+    error: TaskError | None = None
+    categoryOverride: str | None = None
+    confirmedOptions: dict | None = None
+    confirmedAutoStart: bool = True
+
+
+class TaskDraft:
+    parsingBusyChanged = Signal(bool)
+    parseSucceeded = Signal(str, object)
+    parseFailed = Signal(str, object)
+    itemsChanged = Signal()
+    itemsCleared = Signal()
+    addFailed = Signal(list, object)
+
+    def __init__(self, coroutineRunner, featureService, add: Callable[[Task, bool], bool]):
+        self._coroutineRunner = coroutineRunner
+        self._featureService = featureService
+        self._add = add
+        self._items: list[DraftItem] = []
+        self._baseOptions: dict[str, Any] = {}
+
+    def urls(self) -> list[str]:
+        return [item.url for item in self._items]
+
+    def items(self) -> list[DraftItem]:
+        return list(self._items)
+
+    def itemByUrl(self, url: str) -> DraftItem | None:
+        for item in self._items:
+            if item.url == url:
+                return item
+        return None
+
+    def taskByUrl(self, url: str) -> Task | None:
+        item = self.itemByUrl(url)
+        return item.task if item else None
+
+    def failCount(self) -> int:
+        return sum(1 for item in self._items if item.error is not None)
+
+    def canConfirm(self) -> bool:
+        return any(item.parseId or item.task is not None for item in self._items)
+
+    def update(self, url: str, mutate: Callable[[Task], None]) -> None:
+        item = self.itemByUrl(url)
+        if item is None or item.task is None:
+            return
+        mutate(item.task)
+        self.itemsChanged.emit()
+
+    def setBaseOptions(self, options: dict) -> None:
+        self._baseOptions = options
+        for item in self._items:
+            if item.task is not None:
+                item.task.setOptions(self._buildOptions(item))
+        self.itemsChanged.emit()
+
+    def setUrlCategory(self, url: str, categoryId: str | None) -> None:
+        item = self.itemByUrl(url)
+        if item is None:
+            return
+        item.categoryOverride = categoryId
+        if item.task is not None:
+            item.task.category = categoryId
+        self.itemsChanged.emit()
+
+    def setUrls(self, urls: list[str]) -> None:
+        seen: set[str] = set()
+        urls = [u for u in urls if u not in seen and not seen.add(u)]
+
+        previous = self._items
+        previousUrls = [item.url for item in previous]
+        nextItems: list[DraftItem] = []
+        submitErrors: list[tuple[str, TaskError]] = []
+        matcher = SequenceMatcher(a=previousUrls, b=urls, autojunk=False)
+
+        for tag, oldStart, oldEnd, newStart, newEnd in matcher.get_opcodes():
+            if tag == "equal":
+                nextItems.extend(previous[oldStart:oldEnd])
+                continue
+            for item in previous[oldStart:oldEnd]:
+                if item.parseId:
+                    self._coroutineRunner.cancel(item.parseId)
+                    item.parseId = ""
+            for url in urls[newStart:newEnd]:
+                item = DraftItem(url=url)
+                self._submit(item)
+                if item.error is not None:
+                    submitErrors.append((url, item.error))
+                nextItems.append(item)
+
+        self._items = nextItems
+        self.parsingBusyChanged.emit(self._isParsing())
+        for url, error in submitErrors:
+            self.parseFailed.emit(url, error)
+        self.itemsChanged.emit()
+
+    def refresh(self, url: str) -> None:
+        item = self.itemByUrl(url)
+        if item is not None and item.error is not None:
+            self._resubmit([item])
+
+    def refreshFailed(self) -> None:
+        self._resubmit([item for item in self._items if item.error is not None])
+
+    def _resubmit(self, items: list[DraftItem]) -> None:
+        for item in items:
+            self._submit(item)
+        self.parsingBusyChanged.emit(self._isParsing())
+        for item in items:
+            if item.error is not None:
+                self.parseFailed.emit(item.url, item.error)
+        self.itemsChanged.emit()
+
+    def _submit(self, item: DraftItem) -> None:
+        item.error = None
+        try:
+            item.parseId = self._coroutineRunner.submit(
+                self._featureService.parse(
+                    TaskOptions.fromOptions({**self._baseOptions, "url": item.url})
+                ),
+                done=self._onParsed,
+                failed=self._onParseFailed,
+                item=item,
+            )
+        except Exception as e:
+            logger.opt(exception=e).error("提交解析请求失败 {}", item.url)
+            item.error = toTaskError(e)
+
+    def addParsedTasks(self, tasks: list[Task]) -> list[str]:
+        if not tasks:
+            return []
+
+        byUrl = {item.url: item for item in self._items}
+        newUrls: list[str] = []
+
+        for task in tasks:
+            url = task.url
+            item = byUrl.get(url)
+            if item is not None:
+                if item.task is not None:
+                    continue
+                if item.parseId:
+                    self._coroutineRunner.cancel(item.parseId)
+                    item.parseId = ""
+            else:
+                newUrls.append(url)
+                item = DraftItem(url=url)
+                self._items.append(item)
+                byUrl[url] = item
+
+            task.setOptions(self._buildOptions(item))
+            item.error = None
+            item.task = task
+            self.parseSucceeded.emit(url, task)
+
+        self.parsingBusyChanged.emit(self._isParsing())
+        self.itemsChanged.emit()
+        return newUrls
+
+    def confirm(self, autoStart=True) -> None:
+        failures: list[tuple[Task, TaskError]] = []
+        for item in self._items:
+            if item.task is not None:
+                if error := self._addTask(item.task, self._buildOptions(item), autoStart):
+                    failures.append((item.task, error))
+            elif item.parseId:
+                item.confirmedOptions = self._buildOptions(item)
+                item.confirmedAutoStart = autoStart
+
+        for item in self._items:
+            if item.parseId and item.confirmedOptions is None:
+                self._coroutineRunner.cancel(item.parseId)
+                item.parseId = ""
+
+        self._items = [item for item in self._items if item.error is not None]
+        self.parsingBusyChanged.emit(self._isParsing())
+        self.itemsChanged.emit()
+        for task, error in failures:
+            self.addFailed.emit([task], error)
+
+    def clear(self) -> None:
+        for item in self._items:
+            if item.parseId:
+                self._coroutineRunner.cancel(item.parseId)
+                item.parseId = ""
+        self._items.clear()
+        self.itemsCleared.emit()
+        self.parsingBusyChanged.emit(self._isParsing())
+
+    def _buildOptions(self, item: DraftItem) -> dict[str, Any]:
+        options = self._baseOptions.copy()
+        if item.categoryOverride is not None:
+            options["category"] = item.categoryOverride
+        return options
+
+    def _isParsing(self) -> bool:
+        return any(item.parseId for item in self._items)
+
+    def _addTask(self, task: Task, options: dict[str, Any], autoStart: bool) -> TaskError | None:
+        task.setOptions(options)
+        folder = task.outputFolder
+        try:
+            self._add(task, autoStart)
+        except TaskError as e:
+            return e
+        saveLastOutputFolder(folder)
+        return None
+
+    def _onParsed(self, task: Task, item: DraftItem) -> None:
+        if item.confirmedOptions is not None:
+            options = item.confirmedOptions
+            item.confirmedOptions = None
+            if error := self._addTask(task, options, item.confirmedAutoStart):
+                self.addFailed.emit([task], error)
+            return
+
+        if not item.parseId:
+            return
+
+        item.parseId = ""
+        task.setOptions(self._buildOptions(item))
+        item.task = task
+        self.parseSucceeded.emit(item.url, task)
+        self.parsingBusyChanged.emit(self._isParsing())
+        self.itemsChanged.emit()
+
+    def _onParseFailed(self, error, item: DraftItem) -> None:
+        if item.confirmedOptions is not None:
+            item.confirmedOptions = None
+            item.parseId = ""
+            logger.warning("后台确认任务解析失败 {}: {}", item.url, error)
+            if self.itemByUrl(item.url) is None:
+                item.error = toTaskError(error)
+                self._items.append(item)
+                self.parseFailed.emit(item.url, item.error)
+                self.itemsChanged.emit()
+            return
+
+        if not item.parseId:
+            return
+
+        item.parseId = ""
+        item.error = toTaskError(error)
+        self.parseFailed.emit(item.url, item.error)
+        logger.warning("解析任务失败 {}: {}", item.url, error)
+        self.parsingBusyChanged.emit(self._isParsing())
+        self.itemsChanged.emit()
